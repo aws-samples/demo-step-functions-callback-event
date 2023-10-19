@@ -1,0 +1,336 @@
+{
+    "Comment": "The main state machine that orchestrates the entire process",
+    "StartAt": "Parse File",
+    "States": {
+        "Parse File": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+                "FunctionName": "${FileParserLambda}",
+                "Payload.$": "$"
+            },
+            "ResultSelector": {
+                "Payload.$": "$.Payload"
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                }
+            ],
+            "Next": "Store Record"
+        },
+        "Store Record": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:putItem",
+            "Parameters": {
+                "TableName": "${AggregatorTable}",
+                "Item": {
+                    "pk": {
+                        "S.$": "$.Payload.date"
+                    },
+                    "sk": {
+                        "S.$": "$.Payload.fileType"
+                    },
+                    "processingStatus": {
+                        "S": "${UploadedStatus}"
+                    }
+                }
+            },
+            "ResultPath": null,
+            "Next": "Check File Type"
+        },
+        "Check File Type": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.Payload.fileType",
+                    "StringEquals": "${WarehouseFileType}",
+                    "Next": "Set Warehouse Status to Started"
+                },
+                {
+                    "Variable": "$.Payload.fileType",
+                    "StringEquals": "${SalesFileType}",
+                    "Next": "Get Warehouse File Status"
+                }
+            ],
+            "Default": "Failed"
+        },
+        "Set Warehouse Status to Started": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:updateItem",
+            "Parameters": {
+                "TableName": "${AggregatorTable}",
+                "Key": {
+                    "pk": {
+                        "S.$": "$.Payload.date"
+                    },
+                    "sk": {
+                        "S": "${WarehouseFileType}"
+                    }
+                },
+                "UpdateExpression": "set #status = :status",
+                "ExpressionAttributeNames": {
+                    "#status": "processingStatus"
+                },
+                "ExpressionAttributeValues": {
+                    ":status": "${StartedStatus}"
+                }
+            },
+            "ResultPath": null,
+            "Next": "Process Warehouse File"
+        },
+        "Process Warehouse File": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution.sync",
+            "Parameters": {
+                "StateMachineArn": "${WarehouseStateMachine}",
+                "Input": {
+                    "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+                }
+            },
+            "ResultPath": null,
+            "Next": "Set Warehouse Status to Completed"
+        },
+        "Set Warehouse Status to Completed": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:updateItem",
+            "Parameters": {
+                "TableName": "${AggregatorTable}",
+                "Key": {
+                    "pk": {
+                        "S.$": "$.Payload.date"
+                    },
+                    "sk": {
+                        "S": "${WarehouseFileType}"
+                    }
+                },
+                "UpdateExpression": "set #status = :status",
+                "ExpressionAttributeNames": {
+                    "#status": "processingStatus"
+                },
+                "ExpressionAttributeValues": {
+                    ":status": "${CompletedStatus}"
+                }
+            },
+            "ResultPath": null,
+            "Next": "Check for Pending Sales file"
+        },
+        "Get Warehouse File Status": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:getItem",
+            "Parameters": {
+                "TableName": "${AggregatorTable}",
+                "Key": {
+                    "pk": {
+                        "S.$": "$.Payload.date"
+                    },
+                    "sk": {
+                        "S": "${WarehouseFileType}"
+                    }
+                },
+                "ProjectionExpression": "processingStatus",
+                "ReturnConsumedCapacity": "NONE"
+            },
+            "ResultPath": "$.getItemResult",
+            "Next": "Is Warehouse File Processed"
+        },
+        "Is Warehouse File Processed": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "And": [
+                        {
+                            "Variable": "$.getItemResult.Item",
+                            "IsPresent": true
+                        },
+                        {
+                            "Variable": "$.getItemResult.Item.processingStatus",
+                            "IsPresent": true
+                        },
+                        {
+                            "Variable": "$.getItemResult.Item.processingStatus.S",
+                            "IsPresent": true
+                        },
+                        {
+                            "Variable": "$.getItemResult.Item.processingStatus.S",
+                            "StringEquals": "${CompletedStatus}"
+                        }
+                    ],
+                    "Next": "Set Sales Status to Started"
+                }
+            ],
+            "Default": "Set Task Token and Pending Status"
+        },
+        "Process Sales File": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution.sync",
+            "Parameters": {
+                "StateMachineArn": "${SalesStateMachine}",
+                "Input": {
+                    "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+                }
+            },
+            "ResultPath": null,
+            "Next": "Set Sales Status to Completed"
+        },
+        "Set Sales Status to Completed": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:updateItem",
+            "Parameters": {
+                "TableName": "${AggregatorTable}",
+                "Key": {
+                    "pk": {
+                        "S.$": "$.Payload.date"
+                    },
+                    "sk": {
+                        "S": "${SalesFileType}"
+                    }
+                },
+                "UpdateExpression": "set #status = :status",
+                "ExpressionAttributeNames": {
+                    "#status": "processingStatus"
+                },
+                "ExpressionAttributeValues": {
+                    ":status": "${CompletedStatus}"
+                }
+            },
+            "ResultPath": null,
+            "Next": "Success"
+        },
+        "Set Sales Status to Started": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:updateItem",
+            "Parameters": {
+                "TableName": "${AggregatorTable}",
+                "Key": {
+                    "pk": {
+                        "S.$": "$.Payload.date"
+                    },
+                    "sk": {
+                        "S": "${SalesFileType}"
+                    }
+                },
+                "UpdateExpression": "set #status = :status",
+                "ExpressionAttributeNames": {
+                    "#status": "processingStatus"
+                },
+                "ExpressionAttributeValues": {
+                    ":status": "${StartedStatus}"
+                }
+            },
+            "ResultPath": null,
+            "Next": "Process Sales File"
+        },
+        "Set Task Token and Pending Status": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem.waitForTaskToken",
+            "Parameters": {
+                "TableName": "${AggregatorTable}",
+                "Key": {
+                    "pk": {
+                        "S.$": "$.Payload.date"
+                    },
+                    "sk": {
+                        "S.$": "$.Payload.fileType"
+                    }
+                },
+                "UpdateExpression": "set #status = :status, #taskToken = :taskToken",
+                "ExpressionAttributeNames": {
+                    "#status": "processingStatus",
+                    "#taskToken": "taskToken"
+                },
+                "ExpressionAttributeValues": {
+                    ":status": {
+                        "S":"${PendingStatus}"
+                    },
+                    ":taskToken": {
+                        "S.$": "$$.Task.Token"
+                    }
+                }
+            },
+            "ResultPath": null,
+            "Next": "Set Sales Status to Started"
+        },
+        "Check for Pending Sales file": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:getItem",
+            "Parameters": {
+                "TableName": "${AggregatorTable}",
+                "Key": {
+                    "pk": {
+                        "S.$": "$.Payload.date"
+                    },
+                    "sk": {
+                        "S": "${SalesFileType}"
+                    }
+                }
+            },
+            "Next": "Does Pending Sales File and Task Token Exist",
+            "ResultPath": "$.getSalesRecord"
+        },
+        "Does Pending Sales File and Task Token Exist": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "And": [
+                        {
+                            "Variable": "$.getSalesRecord.Item",
+                            "IsPresent": true
+                        },
+                        {
+                            "Variable": "$.getSalesRecord.Item.processingStatus",
+                            "IsPresent": true
+                        },
+                        {
+                            "Variable": "$.getSalesRecord.Item.processingStatus.S",
+                            "IsPresent": true
+                        },
+                        {
+                            "Variable": "$.getSalesRecord.Item.processingStatus.S",
+                            "StringMatches": "${PendingStatus}"
+                        },
+                        {
+                            "Variable": "$.getSalesRecord.Item",
+                            "IsPresent": true
+                        },
+                        {
+                            "Variable": "$.getSalesRecord.Item.taskToken",
+                            "IsPresent": true
+                        },
+                        {
+                            "Variable": "$.getSalesRecord.Item.taskToken.S",
+                            "IsPresent": true
+                        }
+                    ],
+                    "Next": "Trigger Sales Workflow to Continue"
+                }
+            ],
+            "Default": "Success"
+        },
+        "Trigger Sales Workflow to Continue": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:sfn:sendTaskSuccess",
+            "Parameters": {
+                "Output": {
+                    "item": "$.getSalesRecord"
+                },
+                "TaskToken.$": "$.getSalesRecord.Item.taskToken.S"
+            },
+            "Next": "Success"
+        },
+        "Failed": {
+            "Type": "Fail"
+        },
+        "Success": {
+            "Type": "Succeed"
+        }
+    }
+}

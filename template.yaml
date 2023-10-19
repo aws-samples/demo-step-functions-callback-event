@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  multi-file-upload-eda
+
+  Sample SAM Template for multi-file-upload-eda
+Parameters:
+  SalesBucketPrefix:
+    Type: String
+    Default: sales
+    Description: The name of the Sales S3 Bucket
+  WarehouseBucketPrefix:
+    Type: String
+    Default: warehouse
+    Description: The name of the Warehouse S3 Bucket
+  AggregatorDDBName:
+    Type: String
+    Default: aggregator
+    Description: The name of the DynamoDB Table 
+
+Globals:
+  Function:
+    Runtime: nodejs18.x
+    Timeout: 180
+    Architectures:
+      - x86_64
+    Tracing: Active
+
+
+Resources:
+  SalesS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Join ['-', [!Ref SalesBucketPrefix, !Select [0, !Split [-, !Select [2, !Split [/, !Ref AWS::StackId ]]]]]]
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+             EventBridgeEnabled: true
+
+  WarehouseS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Join ['-', [!Ref WarehouseBucketPrefix, !Select [0, !Split [-, !Select [2, !Split [/, !Ref AWS::StackId ]]]]]]
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+             EventBridgeEnabled: true
+
+  AggregatorTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref AggregatorDDBName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S            
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE        
+
+  AggregatorStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/aggregator.asl.json
+      DefinitionSubstitutions:
+        AggregatorTable: !Ref AggregatorTable
+        WarehouseStateMachine: !Ref WarehouseStateMachine
+        SalesStateMachine: !Ref SalesStateMachine
+        FileParserLambda: !Ref FileParserFunction
+        WarehouseFileType: "warehouse"
+        SalesFileType: "sales"
+        UploadedStatus: "Uploaded"
+        StartedStatus: "Started"
+        FailedStatus: "Failed"
+        CompletedStatus: "Completed"
+        PendingStatus: "Pending"
+      Role: !GetAtt AggregatorSFRole.Arn
+      Events:
+        S3EventBridgeTrigger:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref SalesS3Bucket
+                    - !Ref WarehouseS3Bucket
+                reason:
+                  - PutObject
+  
+  WarehouseStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/warehouse.asl.json
+      Role: !GetAtt WarehouseSFRole.Arn
+  
+  SalesStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/sales.asl.json
+      Role: !GetAtt SalesSFRole.Arn
+
+
+  FileParserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/fileparser/
+      Handler: app.lambdaHandler    
+      Environment:
+        Variables:
+          AGGREGATOR_TABLE: !Ref AggregatorTable
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !GetAtt AggregatorTable.Arn
+      
+  
+  AggregatorSFRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: Allow
+            Principal:
+              Service: "states.amazonaws.com"
+            Action: "sts:AssumeRole"
+            Condition: 
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      Policies: 
+        - PolicyName: AggregatorSFPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AggregatorDDBReadWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AggregatorTable.Arn
+              - Sid: AggregatorLambdaInvoke
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: 
+                  - !GetAtt FileParserFunction.Arn
+              - Sid: CloudWatchLogPermissions
+                Effect: Allow
+                Action: 
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+              - Sid: XrayPermissions
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+              - Sid: StartEmbeddedStateMachines
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Ref SalesStateMachine
+                  - !Ref WarehouseStateMachine
+              - Sid: DescribeStopEmbbededStateMachines
+                Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource:
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution/${SalesStateMachine.Name}:*"
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution/${WarehouseStateMachine.Name}:*"
+              - Sid: EventsForEmbeddedStateMachines
+                Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: 
+                  - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+                
+              
+  WarehouseSFRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: Allow
+            Principal:
+              Service: "states.amazonaws.com"
+            Action: "sts:AssumeRole"
+            Condition: 
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+
+  SalesSFRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: Allow
+            Principal:
+              Service: "states.amazonaws.com"
+            Action: "sts:AssumeRole"
+            Condition: 
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+
+  StateMachineDDBPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SendTaskSuccessForStateMachines
+            Effect: Allow
+            Action:
+              - states:SendTaskSuccess
+            Resource: !Ref AggregatorStateMachine
+      PolicyName: AggregatorSendTaskSuccessPolicy
+      Roles: 
+        - !Ref AggregatorSFRole
+        
+#Outputs:

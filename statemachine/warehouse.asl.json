@@ -1,0 +1,9 @@
+{
+    "Comment": "Mock state machine to process warehouse file",
+    "StartAt": "Mock State",
+    "States": {
+        "Mock State": {
+            "Type": "Succeed"
+        }
+    }
+}
