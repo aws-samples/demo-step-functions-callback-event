@@ -1,6 +1,6 @@
 # Orchestrating dependent file uploads with Step Functions
 
-This project is described in the AWS blog post here: < link to blog post >
+This project is described in this AWS [blog post](https://aws.amazon.com/blogs/compute/orchestrating-dependent-file-uploads-with-aws-step-functions/).
 
 ## Getting Started
 
